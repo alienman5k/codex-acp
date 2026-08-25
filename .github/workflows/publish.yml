@@ -29,19 +29,10 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      # Generating a GitHub token, so that PRs and tags created by
-      # the release-please-action can trigger actions workflows.
-      - name: Generate GitHub token
-        uses: actions/create-github-app-token@v3
-        id: generate-token
-        with:
-          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
-          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
-
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          token: ${{ steps.generate-token.outputs.token }}
+          token: ${{ github.token }}
           # Do not add release-type here. The action ignores config-file whenever
           # release-type is set, which would silently drop
           # include-component-in-tag and start tagging codex-acp-vX.Y.Z instead of
@@ -142,10 +133,10 @@ jobs:
           bun-version: 1.3.11
       - name: Install dependencies
         run: npm ci
-      - name: Build Linux binaries
-        run: npm run bundle:linux-x64 && npm run bundle:linux-arm64
-      - name: Package Linux binaries
-        run: npm run package:linux-x64 && npm run package:linux-arm64
+      - name: Build Linux binary
+        run: npm run bundle:linux-x64
+      - name: Package Linux binary
+        run: npm run package:linux-x64
       - name: Resolve release tag
         id: release-tag
         run: |
@@ -165,12 +156,10 @@ jobs:
       - name: Prepare versioned Linux release assets
         run: |
           cp dist/bin/codex-acp-x64-linux.zip "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64-linux.zip"
-          cp dist/bin/codex-acp-arm64-linux.zip "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-arm64-linux.zip"
       - name: Upload Linux release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ steps.release-tag.outputs.tag }}" \
             "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64-linux.zip" \
-            "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-arm64-linux.zip" \
             --clobber

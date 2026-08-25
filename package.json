@@ -19,7 +19,7 @@
     "prepublishOnly": "npm run build",
     "build": "node build.mjs",
     "bundle:all": "npm run bundle:linux-x64 && npm run bundle:linux-arm64 && npm run bundle:darwin-x64 && npm run bundle:darwin-arm64 && npm run bundle:win-x64 && npm run bundle:win-arm64",
-    "bundle:linux-x64": "bun build src/index.ts --minify --sourcemap --compile --target=bun-linux-x64-baseline --outfile dist/bin/codex-acp-x64-linux",
+    "bundle:linux-x64": "bun build src/index.ts --minify --sourcemap --compile --target=bun-linux-x64-baseline-musl --outfile dist/bin/codex-acp-x64-linux",
     "bundle:linux-arm64": "bun build src/index.ts --minify --sourcemap --compile --target=bun-linux-arm64 --outfile dist/bin/codex-acp-arm64-linux",
     "bundle:darwin-x64": "bun build src/index.ts --minify --sourcemap --compile --target=bun-darwin-x64-baseline --outfile dist/bin/codex-acp-x64-darwin",
     "bundle:darwin-arm64": "bun build src/index.ts --minify --sourcemap --compile --target=bun-darwin-arm64 --outfile dist/bin/codex-acp-arm64-darwin",
