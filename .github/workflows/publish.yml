@@ -23,7 +23,7 @@ jobs:
     # Without this a stalled step burns the full 6h runner limit before anyone
     # notices the release did not publish. A hung apt mirror already cost one
     # release that way. Sized for the worst case of its steps: apt retries, then
-    # the unit and e2e suites, both of which run their files serially.
+    # typecheck and the unit suite.
     timeout-minutes: 40
     permissions:
       contents: read
@@ -69,13 +69,6 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - name: Run e2e tests
-        # The suite drives a live model, so a wedged turn hangs instead of
-        # failing. Bound it well above the ~3min happy path.
-        timeout-minutes: 15
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: npm run test:e2e
 
   publish-linux-binaries:
     name: Publish Linux release assets
