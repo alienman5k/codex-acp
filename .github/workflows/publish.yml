@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # Without this a stalled step burns the full 6h runner limit before anyone
     # notices the release did not publish. A hung apt mirror already cost one
     # release that way. Sized for the worst case of its steps: apt retries, then
@@ -74,7 +74,7 @@ jobs:
     name: Publish Linux release assets
     needs: [verify]
     if: ${{ always() && needs.verify.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     environment: release
     permissions:
@@ -95,6 +95,17 @@ jobs:
         run: npm run bundle:linux-x64
       - name: Package Linux binary
         run: npm run package:linux-x64
+      - name: Download appimagetool
+        run: |
+          curl -fsSL -o dist/bin/appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+      - name: Build AppImage
+        run: |
+          chmod +x scripts/build-appimage.sh
+          scripts/build-appimage.sh \
+            dist/bin/codex-acp-x64-linux \
+            dist/bin/appimagetool-x86_64.AppImage \
+            dist/bin/codex-acp-x64.AppImage
       - name: Resolve release tag
         id: release-tag
         run: |
@@ -116,10 +127,12 @@ jobs:
       - name: Prepare versioned Linux release assets
         run: |
           cp dist/bin/codex-acp-x64-linux.zip "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64-linux.zip"
+          cp dist/bin/codex-acp-x64.AppImage "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64.AppImage"
       - name: Upload Linux release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ steps.release-tag.outputs.tag }}" \
             "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64-linux.zip" \
+            "dist/bin/codex-acp-${{ steps.release-tag.outputs.version }}-x64.AppImage" \
             --clobber
