@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.7.0](https://github.com/alienman5k/codex-acp/compare/v1.6.2...v1.7.0) (2026-08-25)
+
+
+### Features
+
+* add ACP v1 permission presentation ([#405](https://github.com/alienman5k/codex-acp/issues/405)) ([8ff9e67](https://github.com/alienman5k/codex-acp/commit/8ff9e67f79335345ce53b3157b3d690c191ea027))
+* expose permission mode kinds ([#430](https://github.com/alienman5k/codex-acp/issues/430)) ([50f69e5](https://github.com/alienman5k/codex-acp/commit/50f69e57ca761ccafd2ca29de7fb591068277516))
+
+
+### Bug Fixes
+
+* publish musl linux release assets in forks ([b3b28a3](https://github.com/alienman5k/codex-acp/commit/b3b28a32697f81bb7d1a84e0f2cfb6b800bc924d))
+* publish versioned linux release assets in forks ([4c0b72b](https://github.com/alienman5k/codex-acp/commit/4c0b72b445e46e8521047cfdeafc6c11cc4d5201))
+* send elicitation complete event for device authentication ([#421](https://github.com/alienman5k/codex-acp/issues/421)) ([6b01a28](https://github.com/alienman5k/codex-acp/commit/6b01a28c4706762a9663914845c51cd605cde339))
+* suppress late session updates after close ([#418](https://github.com/alienman5k/codex-acp/issues/418)) ([ae048a6](https://github.com/alienman5k/codex-acp/commit/ae048a66e485bae5184cb87ae75fcfa1549b69d5))
+
 ## [1.6.2](https://github.com/agentclientprotocol/codex-acp/compare/v1.6.1...v1.6.2) (2026-08-19)
 
 
