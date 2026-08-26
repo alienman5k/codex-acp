@@ -48,20 +48,24 @@ Run from binaries
    ```bash
    unzip codex-acp-<platform>.zip
    ```
-3. Adjust ACP client config
+3. Use the launcher included in Linux and macOS archives:
+   - `./codex-acp` checks `CODEX_PATH` first.
+   - If `CODEX_PATH` is unset, it falls back to `codex` on `PATH`.
+   - The archive still includes the platform binary (`codex-acp-<arch>-<platform>`) that the launcher execs.
+4. Adjust ACP client config
 
 ```json
 {
   "agent_servers": {
     "Codex (app-server)": {
       "command": "/path/to/codex-acp",
-      "env": {
-        "CODEX_PATH": "/path/to/codex"
-      }
+      "env": {}
     }
   }
 }
 ```
+
+Set `CODEX_PATH` explicitly only when the target Codex executable is not already available on `PATH`, or when you need to force a specific binary.
 
 ### Build binaries
 
