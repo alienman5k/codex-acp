@@ -38,8 +38,6 @@ The npm package includes a compatible `@openai/codex` dependency. Set `CODEX_PAT
 CODEX_PATH=/path/to/codex npx -y @agentclientprotocol/codex-acp
 ```
 
-Standalone release archives for Linux and macOS now include a `codex-acp` shell launcher. It checks `CODEX_PATH` first, then falls back to `codex` on `PATH`, and finally runs the bundled platform executable next to it.
-
 ## Authentication
 
 The adapter advertises ACP auth methods during initialization. Clients can authenticate with:
