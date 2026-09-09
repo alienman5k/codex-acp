@@ -7,6 +7,7 @@ permissions: {}
 
 jobs:
   e2e:
+    if: github.repository == 'agentclientprotocol/codex-acp'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:

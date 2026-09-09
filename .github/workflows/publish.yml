@@ -141,6 +141,7 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - name: Run e2e tests
+        if: github.repository == 'agentclientprotocol/codex-acp'
         # The suite drives a live model, so a wedged turn hangs instead of
         # failing. Bound it well above the ~3min happy path.
         timeout-minutes: 15
