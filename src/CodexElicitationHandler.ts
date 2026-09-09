@@ -217,11 +217,29 @@ export class CodexElicitationHandler implements ElicitationHandler {
                 context.isToolApproval,
                 context.persistOptions,
             );
-            if (correlatedCallId !== undefined && result.action === "accept") {
-                await this.connection.notify(acp.methods.client.session.update, {
-                    sessionId: params.threadId,
-                    update: { sessionUpdate: "tool_call_update", toolCallId: correlatedCallId, status: "in_progress" },
-                });
+            if (correlatedCallId !== undefined) {
+                if (result.action === "accept") {
+                    await this.connection.notify(acp.methods.client.session.update, {
+                        sessionId: params.threadId,
+                        update: { sessionUpdate: "tool_call_update", toolCallId: correlatedCallId, status: "in_progress" },
+                    });
+                }
+            } else {
+                try {
+                    await this.connection.notify(acp.methods.client.session.update, {
+                        sessionId: params.threadId,
+                        update: {
+                            sessionUpdate: "tool_call_update",
+                            toolCallId: request.toolCall.toolCallId,
+                            status: "completed",
+                            title: request.toolCall.title,
+                            content: request.toolCall.content,
+                            rawOutput: { action: result.action },
+                        },
+                    });
+                } catch (error) {
+                    logger.error("Failed to finalize standalone MCP elicitation tool call", error);
+                }
             }
             return result;
         } catch (error) {
@@ -325,6 +343,7 @@ export class CodexElicitationHandler implements ElicitationHandler {
             case "url":
                 return clientSupportsUrlElicitation(this.clientCapabilities);
             case "openai/form":
+            case "openaiForm":
                 return false;
         }
     }
@@ -334,7 +353,7 @@ export class CodexElicitationHandler implements ElicitationHandler {
     }
 
     private isMessageOnlyForm(params: McpServerElicitationRequestParams): boolean {
-        if (params.mode !== "form" && params.mode !== "openai/form") return false;
+        if (params.mode !== "form" && params.mode !== "openai/form" && params.mode !== "openaiForm") return false;
         if (params.requestedSchema === null) return true;
         if (!isRecord(params.requestedSchema)) return false;
         return params.requestedSchema["type"] === "object"

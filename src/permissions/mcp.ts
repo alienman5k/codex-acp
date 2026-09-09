@@ -118,14 +118,18 @@ export function buildMcpPermissionRequest(
                     toolCallId: nextStandaloneToolCallId(),
                     kind: context.isToolApproval ? "execute" : "other",
                     status: "pending",
+                    title: context.isToolApproval ? "MCP tool call approval" : "Question from MCP server",
                     content: [messageContent],
-                    rawInput: {serverName: params.serverName, schema: params.requestedSchema},
+                    rawInput: {serverName: params.serverName, description: params.message, schema: params.requestedSchema},
                 },
                 ...(context.isToolApproval ? {_meta: {is_mcp_tool_approval: true}} : {}),
                 options,
             },
             correlatedCallId: undefined,
         };
+    }
+    if (params.mode !== "url") {
+        throw new Error(`Unsupported MCP elicitation mode: ${params.mode}`);
     }
     return {
         request: {
@@ -134,8 +138,9 @@ export function buildMcpPermissionRequest(
                 toolCallId: `elicitation-${params.elicitationId}`,
                 kind: "fetch",
                 status: "pending",
+                title: "MCP server requests to open a URL",
                 content: [messageContent],
-                rawInput: {serverName: params.serverName, url: params.url},
+                rawInput: {serverName: params.serverName, description: params.message, url: params.url},
             },
             options,
         },
