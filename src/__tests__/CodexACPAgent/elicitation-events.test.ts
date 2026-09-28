@@ -307,6 +307,7 @@ describe('Elicitation Events', () => {
                         status: "inProgress",
                         arguments: { argument: "example" },
                         appContext: null,
+                        mcpAppUi: null,
                         readOnlyHint: null,
                         pluginId: null,
                         result: null,
@@ -334,7 +335,7 @@ describe('Elicitation Events', () => {
                 method: 'requestPermission',
                 args: [{
                     sessionId,
-                    toolCall: {toolCallId: 'call-id', kind: 'execute', status: 'pending'},
+                    toolCall: {toolCallId: 'call-id', status: 'pending'},
                 }],
             });
             expect(events[0]!.args[0].options.map((option: {name: string}) => option.name)).toEqual([
@@ -600,6 +601,7 @@ describe('Elicitation Events', () => {
                         status: "inProgress",
                         arguments: { argument: "example" },
                         appContext: null,
+                        mcpAppUi: null,
                         readOnlyHint: null,
                         pluginId: null,
                         result: null,
@@ -622,6 +624,7 @@ describe('Elicitation Events', () => {
                         status: "completed",
                         arguments: { argument: "example" },
                         appContext: null,
+                        mcpAppUi: null,
                         readOnlyHint: null,
                         pluginId: null,
                         result: { content: [], structuredContent: null, _meta: null },
@@ -672,6 +675,7 @@ describe('Elicitation Events', () => {
                         status: "inProgress",
                         arguments: { argument: "example" },
                         appContext: null,
+                        mcpAppUi: null,
                         readOnlyHint: null,
                         pluginId: null,
                         result: null,

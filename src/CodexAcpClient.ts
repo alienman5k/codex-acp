@@ -46,7 +46,9 @@ import type {
     Thread,
     ThreadGoal,
     ThreadGoalStatus,
+    ThreadResumeParams,
     ThreadSourceKind,
+    ThreadItem,
     TurnCompletedNotification,
     TurnSteerResponse,
     UserInput,
@@ -59,7 +61,24 @@ import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike} from "./PathUt
 import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
 import {forkSession as runForkSession} from "./SessionFork";
 import type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+import {isMissingRolloutError, isUnknownThreadError} from "./CodexThreadErrors";
 export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+
+/**
+ * The slice of `thread/resume` the session layer consumes, plus whether Codex
+ * actually had a rollout for the thread. See {@link CodexAcpClient.resumeThread}.
+ */
+type ResumedThread = {
+    thread: Thread;
+    model: string | null;
+    modelProvider: string;
+    reasoningEffort: ReasoningEffort | null;
+    serviceTier: string | null;
+    itemsBackwardsCursor: string | null;
+    materialized: boolean;
+    /** The mode that the resume response reports. Null when the thread has no rollout yet. */
+    collaborationMode: ModeKind | null;
+};
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -516,11 +535,63 @@ export class CodexAcpClient {
         return settingsModelProvider?.config?.model_provider ?? null;
     }
 
+    /**
+     * `thread/resume`, with a fallback for a thread Codex has not materialized
+     * on disk yet.
+     *
+     * Codex writes a thread's rollout file on its first user message, so
+     * `thread/resume` fails with "no rollout found" for a session that was
+     * created but never prompted. Such a thread is still live in the
+     * app-server -- and still subscribed, since `thread/start` subscribed it --
+     * so `thread/read` answers for it and gives back the same state resume
+     * would have. A thread id Codex has genuinely never seen fails both calls,
+     * and the original resume error is what the caller sees.
+     */
+    private async resumeThread(params: ThreadResumeParams): Promise<ResumedThread> {
+        try {
+            const response = await this.codexClient.threadResume(params);
+            return {
+                thread: response.thread,
+                model: response.model,
+                modelProvider: response.modelProvider,
+                reasoningEffort: response.reasoningEffort,
+                serviceTier: response.serviceTier,
+                itemsBackwardsCursor: response.itemsBackwardsCursor ?? null,
+                materialized: true,
+                collaborationMode: response.collaborationMode?.mode ?? null,
+            };
+        } catch (err) {
+            if (!isMissingRolloutError(err)) throw err;
+            let response;
+            try {
+                response = await this.codexClient.threadRead({threadId: params.threadId});
+            } catch {
+                throw err;
+            }
+            logger.log("Thread has no rollout yet; resumed it from its live app-server state", {
+                threadId: params.threadId,
+            });
+            return {
+                thread: response.thread,
+                model: response.thread.model,
+                modelProvider: response.thread.modelProvider,
+                reasoningEffort: response.thread.reasoningEffort,
+                serviceTier: null,
+                // An unmaterialized thread has no persisted history to hydrate:
+                // `thread/turns/list` rejects it outright ("not materialized
+                // yet"), and there is nothing to list either way.
+                itemsBackwardsCursor: null,
+                materialized: false,
+                collaborationMode: null,
+            };
+        }
+    }
+
     async resumeSession(request: acp.ResumeSessionRequest, onSubscribed?: () => void): Promise<SessionMetadata> {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         await this.refreshSkills(request.cwd, additionalDirectories);
 
-        const response = await this.codexClient.threadResume({
+        const response = await this.resumeThread({
             excludeTurns: true,
             config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
             cwd: request.cwd,
@@ -534,7 +605,8 @@ export class CodexAcpClient {
             sessionId: request.sessionId,
             currentModelId: currentModelId,
             models: codexModels,
-            collaborationMode: this.getCollaborationMode(response.thread.id),
+            // Codex sends no thread/settings/updated on a resume. The response holds the mode.
+            collaborationMode: response.collaborationMode ?? this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
             currentServiceTier: response.serviceTier as ServiceTier ?? null,
             additionalDirectories,
@@ -560,7 +632,7 @@ export class CodexAcpClient {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         await this.refreshSkills(request.cwd, additionalDirectories);
 
-        const response = await this.codexClient.threadResume({
+        const response = await this.resumeThread({
             excludeTurns: true,
             config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
             cwd: request.cwd,
@@ -570,30 +642,58 @@ export class CodexAcpClient {
         onSubscribed?.();
         // Resume cursors bound durable history; later turns arrive through live events.
         // A null paginated cursor means there was no durable history at resume time.
-        const thread = response.thread.historyMode === "paginated"
-            ? {
-                ...response.thread,
-                turns: response.turnsBackwardsCursor === null
-                    ? []
-                    : await this.codexClient.threadReadHistory(response.thread.id, response.turnsBackwardsCursor),
+        let thread: Thread = {...response.thread, turns: []};
+        let history: AsyncIterable<ThreadItem[]> = noItems();
+        if (response.materialized && response.thread.historyMode === "paginated") {
+            if (response.itemsBackwardsCursor !== null) {
+                history = this.codexClient.threadItemPages(response.thread.id, {lastItemCursor: response.itemsBackwardsCursor});
             }
-            : (await this.codexClient.threadReadWithHistory(response.thread.id)).thread;
+        } else if (response.materialized) {
+            // A legacy store reads the whole history in one request.
+            const legacy = (await this.codexClient.threadReadWithHistory(response.thread.id)).thread;
+            thread = {...legacy, turns: []};
+            history = oneItemPage(legacy.turns.flatMap(turn => turn.items));
+        }
         const codexModels = await this.fetchAvailableModels();
         const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
         return {
             sessionId: request.sessionId,
             currentModelId: currentModelId,
             models: codexModels,
-            collaborationMode: this.getCollaborationMode(response.thread.id),
+            // Codex sends no thread/settings/updated on a resume. The response holds the mode.
+            collaborationMode: response.collaborationMode ?? this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
             currentServiceTier: response.serviceTier as ServiceTier ?? null,
             thread,
+            history,
             additionalDirectories,
         };
     }
 
-    async readSessionThread(sessionId: string): Promise<Thread> {
-        return (await this.codexClient.threadReadWithHistory(sessionId)).thread;
+    /**
+     * The items of the turn at `index` of a session, oldest first, in pages.
+     * Returns null when the session has fewer turns.
+     */
+    async readSessionTurnItems(sessionId: string, index: number): Promise<AsyncIterable<ThreadItem[]> | null> {
+        const metadata = await this.codexClient.threadRead({threadId: sessionId});
+        if (metadata.thread.historyMode === "legacy") {
+            const legacy = await this.codexClient.threadRead({threadId: sessionId, includeTurns: true});
+            const turn = legacy.thread.turns[index];
+            return turn ? oneItemPage(turn.items) : null;
+        }
+        let first = 0;
+        const pages = this.codexClient.threadTurnPages({
+            threadId: sessionId,
+            limit: 50,
+            sortDirection: "asc",
+            itemsView: "notLoaded",
+        });
+        for await (const page of pages) {
+            const turn = page[index - first];
+            if (turn) return this.codexClient.threadItemPages(sessionId, {turnId: turn.id});
+            first += page.length;
+        }
+        return null;
     }
 
     async newSession(request: acp.NewSessionRequest): Promise<SessionMetadata> {
@@ -632,7 +732,21 @@ export class CodexAcpClient {
     }
 
     async deleteSession(sessionId: string): Promise<void> {
-        await this.codexClient.threadArchive({threadId: sessionId});
+        try {
+            await this.codexClient.threadArchive({threadId: sessionId});
+        } catch (err) {
+            // Deleting a session is idempotent: an id Codex has no persisted
+            // thread for has nothing left to archive. That covers a session
+            // that was created but never prompted (Codex materializes the
+            // rollout on the first user message), an already-deleted session,
+            // and an ACP session id that is not a Codex thread id at all --
+            // ACP session ids are opaque strings, Codex thread ids are UUIDs.
+            if (!isUnknownThreadError(err)) throw err;
+            logger.log("Delete request for a session Codex has no persisted thread for; treating as deleted", {
+                sessionId,
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
     }
 
     async renameSession(sessionId: string, name: string): Promise<void> {
@@ -804,15 +918,12 @@ export class CodexAcpClient {
             return;
         }
 
+        // Codex reads the skill files again for each turn by itself, so only a change of the roots needs a request.
         const skillExtraRoots = additionalRoots.map(root => path.join(root, ".agents", "skills"));
         if (!arraysEqual(this.skillExtraRoots, skillExtraRoots)) {
             await this.codexClient.skillsExtraRootsSet({ extraRoots: skillExtraRoots });
             this.skillExtraRoots = skillExtraRoots;
         }
-        await this.codexClient.listSkills({
-            cwds: [cwd, ...additionalRoots],
-            forceReload: true,
-        });
     }
 
     /**
@@ -1058,10 +1169,13 @@ export class CodexAcpClient {
 
         const preferredProvider = this.getModelProvider();
         const modelProviders = preferredProvider ? [preferredProvider] : [];
+        // The state DB answers in milliseconds. Without the flag, Codex scans and repairs every rollout file on
+        // each call, which took about 4 s per page.
         const listResponse = await this.codexClient.threadList({
             cursor: request.cursor ?? null,
             modelProviders: modelProviders,
             sourceKinds: sourceKinds,
+            useStateDbOnly: true,
         });
 
         const mapThreadToSession = (thread: Thread) => ({
@@ -1070,11 +1184,6 @@ export class CodexAcpClient {
             title: (thread.name ?? thread.preview) || null,
             updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
         });
-
-        if (listResponse.data.length === 0) {
-            const diagnostics = await this.runSessionListDiagnostics();
-            logger.log("Session list diagnostics", diagnostics);
-        }
 
         let sessions = listResponse.data.map(mapThreadToSession);
         if (requestedCwd) {
@@ -1120,29 +1229,6 @@ export class CodexAcpClient {
         } while (cursor);
 
         return models;
-    }
-
-    private async runSessionListDiagnostics(): Promise<Record<string, unknown>> {
-        const [allProviders, archivedAllProviders, customGateway] = await Promise.all([
-            this.codexClient.threadList({}),
-            this.codexClient.threadList({archived: true}),
-            this.codexClient.threadList({modelProviders: [CUSTOM_GATEWAY_PROVIDER_ID]}),
-        ]);
-
-        return {
-            allProviders: {
-                count: allProviders.data.length,
-                nextCursor: allProviders.nextCursor ?? null,
-            },
-            archivedAllProviders: {
-                count: archivedAllProviders.data.length,
-                nextCursor: archivedAllProviders.nextCursor ?? null,
-            },
-            customGateway: {
-                count: customGateway.data.length,
-                nextCursor: customGateway.nextCursor ?? null,
-            },
-        };
     }
 
 }
@@ -1353,4 +1439,10 @@ function mergeGatewayConfig(config: JsonObject, gatewayConfig: GatewayConfig | n
     } else {
         return config;
     }
+}
+
+async function* noItems(): AsyncGenerator<ThreadItem[]> {}
+
+async function* oneItemPage(items: ThreadItem[]): AsyncGenerator<ThreadItem[]> {
+    if (items.length > 0) yield items;
 }
