@@ -1,11 +1,11 @@
-import type * as acp from "@agentclientprotocol/sdk";
+import type * as acp from "@agentclientprotocol/sdk/unstable";
 import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {beforeAll, describe, expect, it} from "vitest";
 import packageJson from "../../../package.json";
 import {schemaErrors} from "./acp-schema";
-import {airOnlyKeys, expectedFromBaseline, lines, mergedReports, metaObjects, withOutputOnce} from "./baseline";
+import {airOnlyKeys, expectedFromBaseline, lines, mergedReports, metaObjects, withFeatureChanges, withOutputOnce} from "./baseline";
 import {
     AIR_CAPABILITY_NAMES,
     fromJsonLines,
@@ -110,6 +110,24 @@ describe("clients that are not AIR, compared with the baseline", () => {
         });
         expect(lines(mergedReports([started, request({})])))
             .not.toEqual(lines(mergedReports([started, request({kind: "execute"})])));
+    });
+
+    it("changes only the baseline /mcp command in the available commands", () => {
+        const commands = (availableCommands: unknown[]): RecordedMessage => ({
+            direction: "notify",
+            method: "session/update",
+            params: {sessionId: "s", update: {sessionUpdate: "available_commands_update", availableCommands}},
+        });
+        const status = {name: "status", description: "Display session configuration and token usage.", input: null};
+        const baselineMcp = {name: "mcp", description: "List configured Model Context Protocol (MCP) tools.", input: null};
+        const otherMcp = {name: "mcp", description: "Another description.", input: null};
+        const mcp = {
+            name: "mcp",
+            description: "Show the status of the MCP servers, or reconnect them.",
+            input: {hint: "[reconnect]"},
+        };
+        expect(withFeatureChanges([commands([status, baselineMcp])])).toEqual([commands([status, mcp])]);
+        expect(withFeatureChanges([commands([status, otherMcp])])).toEqual([commands([status, otherMcp])]);
     });
 
     it.runIf(RECORD_BASELINE)("records the baseline", () => {
@@ -457,7 +475,7 @@ describe("subagents", () => {
         it(`air: gets a replayed ${tool} as the tool call that the live session reports`, async () => {
             const endState = tool === "closeAgent" ? "completed" : "running";
             const spawn = collab("spawn-1", "spawnAgent", "completed", "running");
-            const activity = {type: "subAgentActivity", id: "act-1", kind: "started", agentThreadId: CHILD_THREAD_ID, agentPath: "/root/weather"};
+            const activity = {type: "subAgentActivity", model: null, reasoningEffort: null, id: "act-1", kind: "started", agentThreadId: CHILD_THREAD_ID, agentPath: "/root/weather"};
             const control = (status: "inProgress" | "completed", state: "running" | "completed") =>
                 collab("control-1", tool, status, state, SESSION_ID, CHILD_THREAD_ID, "Use Celsius.");
             const reported = async (each: Scenario) => normalize(await runScenario(each, "air"))

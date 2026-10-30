@@ -1,15 +1,121 @@
 import { describe, it, expect, vi } from "vitest";
-import type * as acp from "@agentclientprotocol/sdk";
+import type * as acp from "@agentclientprotocol/sdk/unstable";
 import { createCodexMockTestFixture, createTestModel } from "../acp-test-utils";
-import type { Model, Thread, ThreadGoal } from "../../app-server/v2";
+import type { Model, Thread, ThreadGoal, UserInput } from "../../app-server/v2";
 
 describe("CodexACPAgent - loadSession", () => {
+    it("preserves every native user input kind during history replay", async () => {
+        const cases: Array<{input: UserInput, content: acp.ContentBlock}> = [
+            {input: {type: "text", text: "Request", text_elements: []}, content: {type: "text", text: "Request"}},
+            {input: {type: "image", url: "https://example.com/image.png"}, content: {type: "text", text: "[@image](https://example.com/image.png)"}},
+            {input: {type: "image", fileId: "saved-image"}, content: {type: "text", text: "image:saved-image"}},
+            {input: {type: "localImage", path: "/workspace/image #1.png"}, content: {type: "resource_link", name: "image #1.png", uri: "file:///workspace/image%20%231.png"}},
+            {input: {type: "audio", url: "https://example.com/audio.wav"}, content: {type: "text", text: "[@audio](https://example.com/audio.wav)"}},
+            {input: {type: "localAudio", path: "/workspace/audio.wav"}, content: {type: "resource_link", name: "audio.wav", uri: "file:///workspace/audio.wav"}},
+            {input: {type: "mention", name: "Document", path: "/workspace/document.pdf"}, content: {type: "resource_link", name: "Document", uri: "file:///workspace/document.pdf"}},
+            {input: {type: "mention", name: "", path: "/workspace/document.pdf"}, content: {type: "resource_link", name: "document.pdf", uri: "file:///workspace/document.pdf"}},
+            {input: {type: "mention", name: "File URI", path: "file:///workspace/document%20one.pdf"}, content: {type: "resource_link", name: "File URI", uri: "file:///workspace/document%20one.pdf"}},
+            {input: {type: "mention", name: "Issue", path: "https://example.com/issue"}, content: {type: "text", text: "[@Issue](https://example.com/issue)"}},
+            {input: {type: "skill", name: "Review", path: "/workspace/SKILL.md"}, content: {type: "text", text: "skill:Review (/workspace/SKILL.md)"}},
+            {input: {type: "localImage", path: "image.png"}, content: {type: "text", text: "[@image.png](image.png)"}},
+            {input: {type: "localAudio", path: "audio.wav"}, content: {type: "text", text: "[@audio.wav](audio.wav)"}},
+            {input: {type: "mention", name: "Relative file", path: "document.pdf"}, content: {type: "text", text: "[@Relative file](document.pdf)"}},
+        ];
+        const fixture = createCodexMockTestFixture();
+        const agent = fixture.getCodexAcpAgent();
+        const client = fixture.getCodexAcpClient();
+        const appServer = fixture.getCodexAppServerClient();
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
+        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
+        client.listSkills = vi.fn().mockResolvedValue({data: []});
+        const model = createTestModel();
+        appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const thread = {
+            id: "native-input-history", historyMode: "legacy", turns: [{
+                id: "turn-1", itemsView: "full", status: "completed", items: cases.map(({input}, index) => ({
+                    type: "userMessage", id: `native-${index}`, clientId: null, content: [input],
+                })),
+            }],
+        } as unknown as Thread;
+        appServer.threadResume = vi.fn().mockResolvedValue({
+            thread, model: model.id, modelProvider: "openai", cwd: "/workspace",
+            approvalPolicy: "never", sandbox: {type: "dangerFullAccess"}, reasoningEffort: model.defaultReasoningEffort,
+        });
+        appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread});
+        await agent.initialize({protocolVersion: 1, clientCapabilities: {}});
+        await agent.loadSession({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
+        const updates = fixture.getAcpConnectionEvents([])
+            .filter(event => event.method === "sessionUpdate")
+            .map(event => event.args[0].update)
+            .filter(update => update.sessionUpdate === "user_message_chunk");
+        expect(updates.map(update => ({messageId: update.messageId, content: update.content}))).toEqual(
+            cases.map(({content}, index) => ({messageId: `native-${index}`, content})),
+        );
+    });
+
+    it("replays Desktop attachments as resources in the original user message", async () => {
+        const fixture = createCodexMockTestFixture();
+        const agent = fixture.getCodexAcpAgent();
+        const client = fixture.getCodexAcpClient();
+        const appServer = fixture.getCodexAppServerClient();
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
+        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
+        client.listSkills = vi.fn().mockResolvedValue({data: []});
+        const model = createTestModel();
+        appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const texts = [
+            '\n# Files pasted by the user:\n\n## "Error log": /workspace/pasted-text.txt\n\n## My request:\nFix job\\_id\n',
+            '# Files pasted by the user:\n\n## "Request": /workspace/request.txt\n\nPasted text contains the user\'s request.\n\n## My request:\n\n',
+            '# Files mentioned by the user:\n\n## unknown: relative.txt\n\n## My request:\nKeep this text',
+            '# Files mentioned by the user:\n\n## screenshot.png: /workspace/screen #1.png\nImage attachment: true\n\n## My request:\nCompare',
+        ];
+        const thread = {
+            id: "attachment-history", historyMode: "legacy", turns: [{
+                id: "turn-1", itemsView: "full", status: "completed", items: texts.map((text, index) => ({
+                    type: "userMessage", id: `user-${index}`, clientId: null,
+                    content: [
+                        ...(index === 3 ? [
+                            {type: "localImage", path: "/workspace/screen #1.png"},
+                            {type: "localAudio", path: "/workspace/screen #1.png"},
+                            {type: "mention", name: "Same image", path: "/workspace/screen #1.png"},
+                        ] : []),
+                        {type: "text", text, text_elements: []},
+                        ...(index === 3 ? [{type: "localImage", path: "/workspace/other.png"}] : []),
+                    ],
+                })),
+            }],
+        } as unknown as Thread;
+        appServer.threadResume = vi.fn().mockResolvedValue({
+            thread, model: model.id, modelProvider: "openai", cwd: "/workspace",
+            approvalPolicy: "never", sandbox: {type: "dangerFullAccess"},
+            reasoningEffort: model.defaultReasoningEffort,
+        });
+        appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread});
+
+        await agent.initialize({protocolVersion: 1, clientCapabilities: {}});
+        await agent.loadSession({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
+
+        const updates = fixture.getAcpConnectionEvents([])
+            .filter(event => event.method === "sessionUpdate")
+            .map(event => event.args[0].update)
+            .filter(update => update.sessionUpdate === "user_message_chunk");
+        expect(updates.map(update => ({messageId: update.messageId, content: update.content}))).toEqual([
+            {messageId: "user-0", content: {type: "resource_link", name: "Error log", uri: "file:///workspace/pasted-text.txt"}},
+            {messageId: "user-0", content: {type: "text", text: "Fix job\\_id\n"}},
+            {messageId: "user-1", content: {type: "resource_link", name: "Request", uri: "file:///workspace/request.txt"}},
+            {messageId: "user-2", content: {type: "text", text: texts[2]}},
+            {messageId: "user-3", content: {type: "resource_link", name: "screenshot.png", uri: "file:///workspace/screen%20%231.png"}},
+            {messageId: "user-3", content: {type: "text", text: "Compare"}},
+            {messageId: "user-3", content: {type: "resource_link", name: "other.png", uri: "file:///workspace/other.png"}},
+        ]);
+    });
+
     it("replays native child history and disconnects an orphan", async () => {
         const fixture = createCodexMockTestFixture();
         const agent = fixture.getCodexAcpAgent();
         const client = fixture.getCodexAcpClient();
         const appServer = fixture.getCodexAppServerClient();
-        client.authRequired = vi.fn().mockResolvedValue(false);
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
         client.listSkills = vi.fn().mockResolvedValue({data: []});
         const model = createTestModel();
@@ -44,6 +150,7 @@ describe("CodexACPAgent - loadSession", () => {
             name: null,
             turns: [{
                 id: `turn-${id}`,
+                rootTurnId: null,
                 itemsView: "full",
                 status: "completed",
                 error: null,
@@ -56,6 +163,8 @@ describe("CodexACPAgent - loadSession", () => {
         const root = makeThread("root-history", [
             {
                 type: "subAgentActivity",
+                model: null,
+                reasoningEffort: null,
                 id: "activity-child-1",
                 kind: "started",
                 agentThreadId: "child-history",
@@ -63,6 +172,8 @@ describe("CodexACPAgent - loadSession", () => {
             },
             {
                 type: "subAgentActivity",
+                model: null,
+                reasoningEffort: null,
                 id: "activity-child-1-terminal",
                 kind: "interrupted",
                 agentThreadId: "child-history",
@@ -70,6 +181,8 @@ describe("CodexACPAgent - loadSession", () => {
             },
             {
                 type: "subAgentActivity",
+                model: null,
+                reasoningEffort: null,
                 id: "activity-child-2",
                 kind: "started",
                 agentThreadId: "child-history",
@@ -77,6 +190,8 @@ describe("CodexACPAgent - loadSession", () => {
             },
             {
                 type: "subAgentActivity",
+                model: null,
+                reasoningEffort: null,
                 id: "activity-child-2-terminal",
                 kind: "interrupted",
                 agentThreadId: "child-history",
@@ -84,6 +199,8 @@ describe("CodexACPAgent - loadSession", () => {
             },
             {
                 type: "subAgentActivity",
+                model: null,
+                reasoningEffort: null,
                 id: "activity-orphan",
                 kind: "started",
                 agentThreadId: "orphan-history",
@@ -119,6 +236,7 @@ describe("CodexACPAgent - loadSession", () => {
         const firstChildTurn = child.turns[0]!;
         child.turns.push({
             id: "turn-child-history-2",
+            rootTurnId: firstChildTurn.rootTurnId,
             itemsView: firstChildTurn.itemsView,
             status: firstChildTurn.status,
             error: firstChildTurn.error,
@@ -190,13 +308,290 @@ describe("CodexACPAgent - loadSession", () => {
         expect(updates[secondOutputIndex]?.sessionId).toBe("child-history:generation:2");
     });
 
+    it("replays a follow-up turn of a finished child as a new generation", async () => {
+        const fixture = createCodexMockTestFixture();
+        const agent = fixture.getCodexAcpAgent();
+        const client = fixture.getCodexAcpClient();
+        const appServer = fixture.getCodexAppServerClient();
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
+        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
+        client.listSkills = vi.fn().mockResolvedValue({data: []});
+        const model = createTestModel();
+        appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const turn = (id: string, items: Thread["turns"][number]["items"]): Thread["turns"][number] => ({
+            id,
+            rootTurnId: null,
+            itemsView: "full",
+            status: "completed",
+            error: null,
+            startedAt: null,
+            completedAt: null,
+            durationMs: null,
+            items,
+        });
+        const makeThread = (id: string, turns: Thread["turns"]): Thread => ({
+            id,
+            sessionId: id,
+            parentThreadId: id === "root-history" ? null : "root-history",
+            threadSource: null,
+            originator: null,
+            forkedFromId: null,
+            preview: id,
+            ephemeral: false,
+            modelProvider: "openai",
+            model: null,
+            reasoningEffort: null,
+            createdAt: 1,
+            updatedAt: 2,
+            recencyAt: null,
+            status: {type: "idle"},
+            path: null,
+            cwd: "/workspace",
+            cliVersion: "0",
+            section: null,
+            sectionEnteredAt: null,
+            projectId: null,
+            historyMode: "legacy",
+            source: "cli",
+            agentNickname: null,
+            agentRole: null,
+            gitInfo: null,
+            name: null,
+            turns,
+        });
+        const activity = (id: string, kind: "started" | "interacted" | "completed") => ({
+            type: "subAgentActivity" as const,
+            model: null,
+            reasoningEffort: null,
+            id,
+            kind,
+            agentThreadId: "child-history",
+            agentPath: "/root/reviewer",
+        });
+        const message = (id: string) => ({
+            type: "agentMessage" as const,
+            id,
+            text: id,
+            phase: null,
+            memoryCitation: null,
+            delivery: null,
+            questions: null,
+        });
+        // Codex records a follow-up to a finished child as an `interacted` activity of the parent.
+        const root = makeThread("root-history", [
+            turn("root-turn-1", [activity("spawn", "started"), activity("first-done", "completed")]),
+            turn("root-turn-2", [activity("followup", "interacted"), activity("followup-done", "completed")]),
+            // This interaction started no child turn.
+            turn("root-turn-3", [activity("message-only", "interacted")]),
+        ]);
+        const child = makeThread("child-history", [
+            turn("child-turn-1", [message("first-answer")]),
+            turn("child-turn-2", [message("followup-answer")]),
+        ]);
+        appServer.threadResume = vi.fn().mockResolvedValue({
+            thread: root,
+            model: model.id,
+            modelProvider: "openai",
+            cwd: "/workspace",
+            approvalPolicy: "never",
+            sandbox: {type: "dangerFullAccess"},
+            reasoningEffort: model.defaultReasoningEffort,
+        });
+        appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: root});
+        appServer.threadRead = vi.fn().mockResolvedValue({thread: child});
+
+        await agent.initialize({
+            protocolVersion: 1,
+            clientCapabilities: {
+                _meta: {jetbrains: {air: {version: 1, capabilities: ["nativeSubagentSessions"]}}},
+            },
+        });
+        await agent.loadSession({sessionId: root.id, cwd: "/workspace", mcpServers: []});
+
+        const updates = fixture.getAcpConnectionEvents([])
+            .filter(event => event.method === "sessionUpdate")
+            .map(event => event.args[0])
+            .filter(({update}) => update.sessionUpdate.startsWith("subagent_")
+                || update.sessionUpdate === "agent_message_chunk")
+            .map(({sessionId, update}) => ({
+                sessionId,
+                update: update.sessionUpdate === "agent_message_chunk" ? update.messageId : update,
+            }));
+        expect(updates).toEqual([
+            {
+                sessionId: "root-history",
+                update: {
+                    sessionUpdate: "subagent_spawned",
+                    subagentSessionId: "child-history",
+                    name: "Reviewer",
+                    task: "Delegated task for Reviewer",
+                    capabilities: {},
+                },
+            },
+            {sessionId: "child-history", update: "first-answer"},
+            {
+                sessionId: "root-history",
+                update: {sessionUpdate: "subagent_state_update", subagentSessionId: "child-history", state: "completed"},
+            },
+            {
+                sessionId: "root-history",
+                update: {
+                    sessionUpdate: "subagent_spawned",
+                    subagentSessionId: "child-history:generation:2",
+                    name: "Reviewer",
+                    task: "Delegated task for Reviewer",
+                    capabilities: {},
+                },
+            },
+            {sessionId: "child-history:generation:2", update: "followup-answer"},
+            {
+                sessionId: "root-history",
+                update: {
+                    sessionUpdate: "subagent_state_update",
+                    subagentSessionId: "child-history:generation:2",
+                    state: "completed",
+                },
+            },
+        ]);
+    });
+
+    it("replays the model of a child only when its activity names it", async () => {
+        const fixture = createCodexMockTestFixture();
+        const agent = fixture.getCodexAcpAgent();
+        const client = fixture.getCodexAcpClient();
+        const appServer = fixture.getCodexAppServerClient();
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
+        client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
+        client.listSkills = vi.fn().mockResolvedValue({data: []});
+        const model = createTestModel();
+        appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const turn = (id: string, items: Thread["turns"][number]["items"]): Thread["turns"][number] => ({
+            id,
+            rootTurnId: null,
+            itemsView: "full",
+            status: "completed",
+            error: null,
+            startedAt: null,
+            completedAt: null,
+            durationMs: null,
+            items,
+        });
+        const makeThread = (id: string, turns: Thread["turns"]): Thread => ({
+            id,
+            sessionId: "root-history",
+            parentThreadId: id === "root-history" ? null : "root-history",
+            threadSource: null,
+            originator: null,
+            forkedFromId: null,
+            preview: id,
+            ephemeral: false,
+            modelProvider: "openai",
+            model: null,
+            reasoningEffort: null,
+            createdAt: 1,
+            updatedAt: 2,
+            recencyAt: null,
+            status: {type: "idle"},
+            path: null,
+            cwd: "/workspace",
+            cliVersion: "0",
+            section: null,
+            sectionEnteredAt: null,
+            projectId: null,
+            historyMode: "legacy",
+            source: "cli",
+            agentNickname: null,
+            agentRole: null,
+            gitInfo: null,
+            name: null,
+            turns,
+        });
+        const spawn = (childThreadId: string, requestedModel: string | null) => ({
+            type: "collabAgentToolCall" as const,
+            id: `spawn-${childThreadId}`,
+            tool: "spawnAgent" as const,
+            status: "completed" as const,
+            senderThreadId: "root-history",
+            receiverThreadIds: [childThreadId],
+            prompt: "Review the diff",
+            model: requestedModel,
+            reasoningEffort: null,
+            agentsStates: {},
+        });
+        const started = (
+            childThreadId: string,
+            resolvedModel: string | null,
+            kind: "started" | "interacted" | "completed" = "started",
+        ) => ({
+            type: "subAgentActivity" as const,
+            model: resolvedModel,
+            reasoningEffort: null,
+            id: `${kind}-${childThreadId}`,
+            kind,
+            agentThreadId: childThreadId,
+            agentPath: `/root/${childThreadId}`,
+        });
+        const root = makeThread("root-history", [
+            turn("root-turn-1", [
+                spawn("resolved", null),
+                started("resolved", model.id),
+                started("unknown", "custom-model"),
+                // A spawn request does not name the model: a role config can override it.
+                spawn("requested", model.id),
+                started("requested", null),
+                started("resolved", null, "completed"),
+            ]),
+            // Codex names the model only at the creation, so the follow-up generation reuses it.
+            turn("root-turn-2", [started("resolved", null, "interacted")]),
+        ]);
+        appServer.threadResume = vi.fn().mockResolvedValue({
+            thread: root,
+            model: model.id,
+            modelProvider: "openai",
+            cwd: "/workspace",
+            approvalPolicy: "never",
+            sandbox: {type: "dangerFullAccess"},
+            reasoningEffort: model.defaultReasoningEffort,
+        });
+        appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: root});
+        appServer.threadRead = vi.fn().mockImplementation(({threadId}: {threadId: string}) =>
+            Promise.resolve({thread: makeThread(threadId, [turn(`${threadId}-turn-1`, []), turn(`${threadId}-turn-2`, [])])}));
+
+        await agent.initialize({
+            protocolVersion: 1,
+            clientCapabilities: {
+                _meta: {jetbrains: {air: {version: 1, capabilities: ["nativeSubagentSessions"]}}},
+            },
+        });
+        await agent.loadSession({sessionId: root.id, cwd: "/workspace", mcpServers: []});
+
+        const updates = fixture.getAcpConnectionEvents([])
+            .filter(event => event.method === "sessionUpdate")
+            .map(event => event.args[0])
+            .filter(({update}) => update.sessionUpdate === "subagent_spawned"
+                || (update.sessionUpdate === "config_option_update" && update.configOptions[0]?.category === "model"
+                    && update.configOptions.length === 1))
+            .map(({sessionId, update}) => update.sessionUpdate === "subagent_spawned"
+                ? `${sessionId} subagent_spawned ${update.subagentSessionId}`
+                : `${sessionId} model ${update.configOptions[0].currentValue} "${update.configOptions[0].options[0].name}"`);
+        expect(updates).toEqual([
+            "root-history subagent_spawned resolved",
+            `resolved model ${model.id} "${model.id}"`,
+            "root-history subagent_spawned unknown",
+            `unknown model custom-model "custom-model"`,
+            "root-history subagent_spawned requested",
+            "root-history subagent_spawned resolved:generation:2",
+            `resolved:generation:2 model ${model.id} "${model.id}"`,
+        ]);
+    });
+
     it("should replay history during loadSession", async () => {
         const fixture = createCodexMockTestFixture();
         const codexAcpAgent = fixture.getCodexAcpAgent();
         const codexAcpClient = fixture.getCodexAcpClient();
         const codexAppServerClient = fixture.getCodexAppServerClient();
 
-        codexAcpClient.authRequired = vi.fn().mockResolvedValue(false);
+        codexAcpClient.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         codexAcpClient.getAccount = vi.fn().mockResolvedValue({
             account: null,
             requiresOpenaiAuth: false,
@@ -263,6 +658,7 @@ describe("CodexACPAgent - loadSession", () => {
             turns: [
                 {
                     id: "turn-1",
+                    rootTurnId: null,
                     itemsView: "full",
                     status: "completed",
                     error: null,
@@ -368,6 +764,8 @@ describe("CodexACPAgent - loadSession", () => {
                         },
                         {
                             type: "subAgentActivity",
+                            model: null,
+                            reasoningEffort: null,
                             id: "item-subagent-1",
                             kind: "started",
                             agentThreadId: "thread-child-1",
@@ -431,7 +829,7 @@ describe("CodexACPAgent - loadSession", () => {
         const agent = fixture.getCodexAcpAgent();
         const client = fixture.getCodexAcpClient();
         const appServer = fixture.getCodexAppServerClient();
-        client.authRequired = vi.fn().mockResolvedValue(false);
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
         client.listSkills = vi.fn().mockResolvedValue({data: []});
         const model = createTestModel();
@@ -466,7 +864,7 @@ describe("CodexACPAgent - loadSession", () => {
         const agent = fixture.getCodexAcpAgent();
         const client = fixture.getCodexAcpClient();
         const appServer = fixture.getCodexAppServerClient();
-        client.authRequired = vi.fn().mockResolvedValue(false);
+        client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
         client.listSkills = vi.fn().mockResolvedValue({data: []});
         const model = createTestModel();
@@ -486,12 +884,14 @@ describe("CodexACPAgent - loadSession", () => {
         appServer.threadItemsList = vi.fn()
             .mockResolvedValueOnce({data: [message("last")], nextCursor: null, backwardsCursor: null})
             .mockResolvedValueOnce({data: [message("first")], nextCursor: "page-2", backwardsCursor: null})
+            .mockResolvedValueOnce({data: [message("second")], nextCursor: "page-3", backwardsCursor: null})
+            // The adapter reads this page while it sends the page before it.
             .mockImplementationOnce(async () => {
                 closed = agent.closeSession({sessionId: "session-1"});
                 await closed;
-                return {data: [message("second")], nextCursor: "page-3", backwardsCursor: null};
+                return {data: [message("third")], nextCursor: "page-4", backwardsCursor: null};
             })
-            .mockResolvedValue({data: [message("more")], nextCursor: "page-3", backwardsCursor: null});
+            .mockResolvedValue({data: [message("more")], nextCursor: "page-4", backwardsCursor: null});
         const closeSpy = vi.spyOn(client, "closeSession").mockResolvedValue(undefined as never);
 
         await agent.initialize({protocolVersion: 1});
@@ -500,13 +900,14 @@ describe("CodexACPAgent - loadSession", () => {
         await closed;
 
         // The page that the close interrupted is the last page read. The load does not close the session again.
-        expect(appServer.threadItemsList).toHaveBeenCalledTimes(3);
+        expect(appServer.threadItemsList).toHaveBeenCalledTimes(4);
         expect(closeSpy).toHaveBeenCalledTimes(1);
         const texts = JSON.stringify(fixture.getAcpConnectionEvents([])
             .filter(event => event.method === "sessionUpdate")
             .map(event => event.args[0]));
         expect(texts).toContain("first");
         expect(texts).not.toContain("second");
+        expect(texts).not.toContain("third");
     });
 
     it("should not recover session mcp servers during loadSession when request omits them", async () => {
@@ -515,7 +916,7 @@ describe("CodexACPAgent - loadSession", () => {
         const codexAcpClient = fixture.getCodexAcpClient();
         const codexAppServerClient = fixture.getCodexAppServerClient();
 
-        codexAcpClient.authRequired = vi.fn().mockResolvedValue(false);
+        codexAcpClient.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         codexAcpClient.getAccount = vi.fn().mockResolvedValue({
             account: null,
             requiresOpenaiAuth: false,
@@ -607,7 +1008,7 @@ describe("CodexACPAgent - loadSession", () => {
         const codexAcpClient = fixture.getCodexAcpClient();
         const codexAppServerClient = fixture.getCodexAppServerClient();
 
-        codexAcpClient.authRequired = vi.fn().mockResolvedValue(false);
+        codexAcpClient.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
         codexAcpClient.getAccount = vi.fn().mockResolvedValue({
             account: null,
             requiresOpenaiAuth: false,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import * as acp from "@agentclientprotocol/sdk";
+import * as acp from "@agentclientprotocol/sdk/unstable";
 import type { ErrorNotification, TurnCompletedNotification } from "../../app-server/v2";
 import type { SessionState } from "../../CodexAcpServer";
 import {
@@ -76,7 +76,124 @@ const typedFailureCapabilities: acp.ClientCapabilities = {
     _meta: {jetbrains: {air: {version: 1, capabilities: ["sessionFailure"]}}},
 };
 
+const modelRefusalMessage = "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.";
+const modelRefusalEnvelope = JSON.stringify({
+    type: "error", status: 400, error: {type: "invalid_request_error", message: modelRefusalMessage},
+});
+
+// The 400 that an LLM gateway returns when the provider can't decrypt reasoning from an earlier turn.
+const invalidEncryptedContentGatewayError = JSON.stringify({
+    error: {
+        message: "Provider returned error",
+        code: 400,
+        metadata: {
+            raw: JSON.stringify({error: {
+                message: "The encrypted content for item rs_1 could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+                type: "invalid_request_error", param: null, code: "invalid_encrypted_content",
+            }}, null, 2),
+            provider_name: "Azure", is_byok: false, provider_error_code: "invalid_encrypted_content",
+        },
+    },
+    user_id: "org_1",
+});
+
 describe("CodexEventHandler - auth error events", () => {
+    it.each([
+        {name: "terminal", retry: false, turnId: "turn-id"},
+        {name: "retry", retry: true, turnId: "turn-id"},
+        {name: "foreign turn", retry: false, turnId: "previous-turn"},
+    ])("reads a known service message for a typed $name failure", async ({retry, turnId}) => {
+        const {result, updates} = await runPromptWithError(createTestSessionState({
+            sessionId: "service-envelope-session", account: {type: "apiKey"},
+        }), {
+            message: modelRefusalEnvelope, codexErrorInfo: "badRequest",
+            additionalDetails: "raw provider diagnostics", misalignment: null,
+        }, retry, typedFailureCapabilities, turnId);
+        const failureContainer = retry || turnId !== "turn-id" ? updates[0] : result;
+        expect(failureContainer).toMatchObject({
+            _meta: {jetbrains: {air: {sessionFailure: {
+                title: modelRefusalMessage, category: "request", severity: retry ? "warning" : "error",
+            }}}},
+        });
+        expect(JSON.stringify({result, updates})).not.toContain(modelRefusalEnvelope);
+    });
+
+    it.each([false, true])("reads a known service message after a turn ends (retry=%s)", async willRetry => {
+        const state = createTestSessionState({sessionId: "late-service-envelope", account: {type: "apiKey"}});
+        const updates: unknown[] = [];
+        const connection = {
+            notify: vi.fn(async (_method: unknown, params: {update: unknown}) => updates.push(params.update)),
+        } as unknown as AcpClientConnection;
+        const handler = createTestEventHandler(connection, state, {typedSessionFailures: true});
+        const notification = {
+            method: "error" as const,
+            params: {
+                threadId: state.sessionId, turnId: "completed-turn", willRetry,
+                error: {message: modelRefusalEnvelope, codexErrorInfo: "badRequest" as const,
+                    additionalDetails: "raw provider diagnostics", misalignment: null},
+            },
+        };
+        await handler.handleSessionScopedNotification(notification);
+        expect(updates).toEqual([expect.objectContaining({
+            _meta: {jetbrains: {air: expect.objectContaining({sessionFailure: expect.objectContaining({
+                title: modelRefusalMessage, severity: willRetry ? "warning" : "error",
+            })})}},
+        })]);
+        expect(notification.params.error.message).toBe(modelRefusalEnvelope);
+        expect(notification.params.error.additionalDetails).toBe("raw provider diagnostics");
+    });
+
+    it("reads the legacy error text and keeps the raw request error diagnostics", async () => {
+        const {result, updates} = await runPromptWithError(createTestSessionState({
+            sessionId: "legacy-service-envelope", account: {type: "apiKey"},
+        }), {
+            message: modelRefusalEnvelope, codexErrorInfo: "usageLimitExceeded", additionalDetails: null, misalignment: null,
+        });
+        expect(updates).toEqual([expect.objectContaining({
+            sessionUpdate: "agent_message_chunk", content: {type: "text", text: `${modelRefusalMessage}\n\n`},
+        })]);
+        expect(result).toMatchObject({data: {message: modelRefusalEnvelope, codexErrorInfo: "usageLimitExceeded"}});
+    });
+
+    it.each([
+        {name: "legacy error text", capabilities: undefined},
+        {name: "typed failure", capabilities: typedFailureCapabilities},
+    ])("explains encrypted content from another provider in the $name", async ({capabilities}) => {
+        const {result, updates} = await runPromptWithError(createTestSessionState({
+            sessionId: "encrypted-content-session", account: {type: "apiKey"},
+        }), {
+            message: invalidEncryptedContentGatewayError, codexErrorInfo: "badRequest", additionalDetails: null, misalignment: null,
+        }, false, capabilities);
+        await expect(JSON.stringify({result, updates}, null, 2)).toMatchFileSnapshot(
+            `data/invalid-encrypted-content-v1-${capabilities ? "typed-failure" : "legacy"}.json`,
+        );
+    });
+
+    it.each([
+        {name: "legacy error text", capabilities: undefined},
+        {name: "typed failure", capabilities: typedFailureCapabilities},
+    ])("explains an unreachable ChatGPT backend as a connection failure in the $name", async ({capabilities}) => {
+        const {result, updates} = await runPromptWithError(createTestSessionState({
+            sessionId: "workspace-routing-session", account: {type: "chatgpt", email: "user@example.com", planType: "plus"},
+        }), {
+            message: "workspace routing discovery failed", codexErrorInfo: "other", additionalDetails: null, misalignment: null,
+        }, false, capabilities);
+        await expect(JSON.stringify({result, updates}, null, 2)).toMatchFileSnapshot(
+            `data/workspace-routing-failed-v1-${capabilities ? "typed-failure" : "legacy"}.json`,
+        );
+    });
+
+    it.each([
+        "Plain error", "", "{invalid JSON}",
+        JSON.stringify({type: "error", status: 400, error: {type: "custom_error", message: "custom text"}}),
+        JSON.stringify({type: "error", status: 400, error: {type: "invalid_request_error", message: ""}}),
+    ])("keeps custom or malformed typed failure text: %s", async message => {
+        const {result} = await runPromptWithError(createTestSessionState({
+            sessionId: "custom-error-session", account: {type: "apiKey"},
+        }), {message, codexErrorInfo: "badRequest", additionalDetails: null, misalignment: null}, false, typedFailureCapabilities);
+        expect(result).toMatchObject({_meta: {jetbrains: {air: {sessionFailure: {title: message}}}}});
+    });
+
     it("publishes a typed terminal failure instead of assistant text when AIR negotiated it", async () => {
         const {result, updates} = await runPromptWithError(createTestSessionState({
             sessionId: "typed-failure-session",
@@ -359,6 +476,7 @@ describe("CodexEventHandler - auth error events", () => {
         ["service", "internalServerError"],
         ["service", "threadRollbackFailed"],
         ["service", "sandboxError"],
+        ["service", "tooManyDenials"],
         ["service", "other"],
         ["connection", {httpConnectionFailed: {httpStatusCode: null}}],
         ["connection", {responseStreamConnectionFailed: {httpStatusCode: 503}}],
@@ -987,6 +1105,7 @@ function createTurn(
     return {
         id,
         items: [],
+        rootTurnId: null,
         itemsView: "notLoaded" as const,
         status,
         error,

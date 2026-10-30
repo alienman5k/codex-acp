@@ -1,11 +1,12 @@
 import {describe, expect, it, vi} from "vitest";
-import type {ThreadItem, ThreadItemsListParams, ThreadTurnsListParams, Turn} from "../../app-server/v2";
+import type {ThreadItem, ThreadItemEntry, ThreadItemsListParams, ThreadTurnsListParams, Turn} from "../../app-server/v2";
 import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
 
 function messageTurn(id: string): Turn {
     return {
         id,
         items: [{type: "userMessage", id: `${id}-input`, clientId: null, content: [{type: "text", text: `Question ${id}`, text_elements: []}]}, {type: "agentMessage", id: `${id}-message`, text: `Answer ${id}`, phase: "final_answer", memoryCitation: null, delivery: null, questions: null}],
+        rootTurnId: null,
         itemsView: "full",
         status: "completed",
         error: null,
@@ -43,6 +44,9 @@ function turnStore(stored: Turn[], pageSize = 2) {
 function itemStore(turns: Turn[], pageSize = 2) {
     const entries = turns.flatMap(turn => turn.items.map(item => ({turnId: turn.id, item, startedAtMs: null, completedAtMs: null})));
     return async ({turnId, cursor, limit, sortDirection}: ThreadItemsListParams) => {
+        if (cursor !== null && typeof cursor === "object") {
+            throw new Error("This history fixture only supports opaque string cursors");
+        }
         const scoped = entries.filter(entry => !turnId || entry.turnId === turnId);
         if (sortDirection === "desc") {
             const index = cursor === null || cursor === undefined
@@ -56,9 +60,9 @@ function itemStore(turns: Turn[], pageSize = 2) {
     };
 }
 
-async function collect(history: AsyncIterable<ThreadItem[]> | null): Promise<string[]> {
+async function collect(history: AsyncIterable<Array<ThreadItem | ThreadItemEntry>> | null): Promise<string[]> {
     const ids: string[] = [];
-    for await (const page of history ?? []) ids.push(...page.map(item => item.id));
+    for await (const page of history ?? []) ids.push(...page.map(item => "turnId" in item ? item.item.id : item.id));
     return ids;
 }
 
@@ -155,6 +159,30 @@ describe("paginated thread history", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("requests the next item page while the caller uses a page, and no page after the resume boundary", async () => {
+        const fixture = createCodexMockTestFixture();
+        const appServer = fixture.getCodexAppServerClient();
+        const turn = messageTurn("large");
+        turn.items = Array.from({length: 9}, (_, index) => ({...turn.items[1]!, id: `message-${index}`}));
+        const pages = vi.spyOn(appServer, "threadItemsList").mockImplementation(itemStore([turn], 3));
+        const requestedPages = () => pages.mock.calls.map(([params]) => `${params.sortDirection}:${params.cursor ?? "start"}`);
+
+        const reader = appServer.threadItemPages("history", {lastItemCursor: "item:message-4"})[Symbol.asyncIterator]();
+        const first = await reader.next();
+        // The caller holds the first page. The second page is already requested.
+        expect(requestedPages()).toEqual(["desc:item:message-4", "asc:start", "asc:asc:3"]);
+        const second = await reader.next();
+        const end = await reader.next();
+
+        expect([first.value, second.value].map(page => page?.map((item: ThreadItem) => item.id))).toEqual([
+            ["message-0", "message-1", "message-2"],
+            ["message-3", "message-4"],
+        ]);
+        expect(end.done).toBe(true);
+        // The second page holds the boundary item, so the third page is never requested.
+        expect(requestedPages()).toEqual(["desc:item:message-4", "asc:start", "asc:asc:3"]);
     });
 
     it("pages the items of one large turn", async () => {
